@@ -23,9 +23,11 @@
     "@mariozechner/pi-coding-agent": ">=0.70.0"
   },
   "devDependencies": {
+    "tsx": "^4.0.0",
     "typescript": "^5.6.0"
   },
   "scripts": {
+    "test": "tsx --test src/*.test.ts",
     "typecheck": "tsc --noEmit"
   }
 }

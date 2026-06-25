@@ -6,15 +6,10 @@ import { join } from "node:path";
 
 const INSTALL_SYMBOL = Symbol.for("ai-configs.pi-claude-hooks.installed");
 
-// Pi runs vahor @vahor/pi-hooks for these memory scripts already; running them
-// again here (they live under SessionStart/SessionEnd in ~/.claude/settings.json)
-// would double-fire the handoff digest and the session_end observation.
-const DEFAULT_SKIP = /memory-session-(start|end)\.sh/;
-
 const TOOL_CALL_TIMEOUT_MS = 5000;
 const LIFECYCLE_TIMEOUT_MS = 10000;
 
-type ClaudeEvent = "PreToolUse" | "SessionStart" | "UserPromptSubmit" | "Stop";
+type ClaudeEvent = "PreToolUse" | "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "Stop";
 
 interface HookCommand {
 	type?: string;
@@ -58,8 +53,11 @@ function readHooksFile(path: string): Record<string, HookMatcher[]> | null {
 
 // Project settings extend (not replace) global settings, mirroring Claude Code's
 // merge order: global first, then the project's .claude/settings.json.
-function matchersFor(event: ClaudeEvent, cwd: string): HookMatcher[] {
-	const sources = [join(homedir(), ".claude", "settings.json"), join(cwd, ".claude", "settings.json")];
+export function matchersFor(
+	event: ClaudeEvent,
+	cwd: string,
+	sources: string[] = [join(homedir(), ".claude", "settings.json"), join(cwd, ".claude", "settings.json")],
+): HookMatcher[] {
 	const matchers: HookMatcher[] = [];
 	for (const source of sources) {
 		const hooks = readHooksFile(source);
@@ -79,13 +77,13 @@ function matcherApplies(matcher: string | undefined, toolNames: string[]): boole
 	return toolNames.some((name) => pattern.test(name));
 }
 
-function commandsFor(event: ClaudeEvent, cwd: string, toolNames: string[]): HookCommand[] {
+// pi-claude-hooks owns the memory session lifecycle; @vahor/pi-hooks was retired.
+export function commandsFor(event: ClaudeEvent, cwd: string, toolNames: string[], sources?: string[]): HookCommand[] {
 	const commands: HookCommand[] = [];
-	for (const entry of matchersFor(event, cwd)) {
+	for (const entry of matchersFor(event, cwd, sources)) {
 		if (!matcherApplies(entry.matcher, toolNames)) continue;
 		for (const hook of entry.hooks ?? []) {
 			if (hook.type !== "command" || !hook.command) continue;
-			if (DEFAULT_SKIP.test(hook.command)) continue;
 			commands.push(hook);
 		}
 	}
@@ -225,6 +223,10 @@ export default function piClaudeHooks(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx: ExtensionContext) =>
 		runLifecycle("SessionStart", ctx, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", cwd: ctx.cwd }), "info"),
+	);
+
+	pi.on("session_shutdown", (_event, ctx: ExtensionContext) =>
+		runLifecycle("SessionEnd", ctx, JSON.stringify({ hook_event_name: "SessionEnd", reason: "other", cwd: ctx.cwd }), "info"),
 	);
 
 	pi.on("input", (event, ctx: ExtensionContext) => {
