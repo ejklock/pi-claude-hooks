@@ -9,7 +9,7 @@ const INSTALL_SYMBOL = Symbol.for("ai-configs.pi-claude-hooks.installed");
 const TOOL_CALL_TIMEOUT_MS = 5000;
 const LIFECYCLE_TIMEOUT_MS = 10000;
 
-type ClaudeEvent = "PreToolUse" | "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "Stop";
+export type ClaudeEvent = "PreToolUse" | "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "Stop";
 
 interface HookCommand {
 	type?: string;
@@ -195,15 +195,25 @@ async function handleToolCall(event: PiToolCallEvent, ctx: ExtensionContext): Pr
 	return undefined;
 }
 
-async function runLifecycle(event: ClaudeEvent, ctx: ExtensionContext, stdin: string, level: "info" | "warning"): Promise<void> {
+// Routine hook stdout is intentionally NOT surfaced — only failures and PreToolUse
+// guard output notify, so recurring status chatter never floods the UI.
+async function runLifecycle(event: ClaudeEvent, ctx: ExtensionContext, stdin: string, sources?: string[]): Promise<void> {
 	if (isDisabled()) return;
-	const commands = commandsFor(event, ctx.cwd, []);
-	const notes: string[] = [];
-	for (const hook of commands) {
-		const result = await runHookCommand(hook.command!, stdin, ctx.cwd, hook.timeout ? hook.timeout * 1000 : LIFECYCLE_TIMEOUT_MS);
-		if (result.stdout.trim()) notes.push(result.stdout.trim());
+	for (const hook of commandsFor(event, ctx.cwd, [], sources)) {
+		await runHookCommand(hook.command!, stdin, ctx.cwd, hook.timeout ? hook.timeout * 1000 : LIFECYCLE_TIMEOUT_MS);
 	}
-	if (notes.length > 0) notify(ctx, notes.join("\n"), level);
+}
+
+// SessionStart hooks (git fetch, daemon warmup) can take tens of seconds; running
+// them detached keeps pi startup instant while their output still surfaces via notify.
+export function runLifecycleDetached(event: ClaudeEvent, ctx: ExtensionContext, stdin: string, sources?: string[]): void {
+	runLifecycle(event, ctx, stdin, sources).catch((error) => {
+		// The ctx may be stale by the time a slow background hook fails (session
+		// already replaced or exited); touching it then throws, so guard the notify.
+		try {
+			notify(ctx, `${event} hooks failed: ${String(error)}`, "warning");
+		} catch {}
+	});
 }
 
 function userPromptText(event: unknown): string {
@@ -221,20 +231,20 @@ export default function piClaudeHooks(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", (event, ctx: ExtensionContext) => handleToolCall(event as PiToolCallEvent, ctx));
 
-	pi.on("session_start", (_event, ctx: ExtensionContext) =>
-		runLifecycle("SessionStart", ctx, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", cwd: ctx.cwd }), "info"),
-	);
+	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+		runLifecycleDetached("SessionStart", ctx, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", cwd: ctx.cwd }));
+	});
 
 	pi.on("session_shutdown", (_event, ctx: ExtensionContext) =>
-		runLifecycle("SessionEnd", ctx, JSON.stringify({ hook_event_name: "SessionEnd", reason: "other", cwd: ctx.cwd }), "info"),
+		runLifecycle("SessionEnd", ctx, JSON.stringify({ hook_event_name: "SessionEnd", reason: "other", cwd: ctx.cwd })),
 	);
 
 	pi.on("input", (event, ctx: ExtensionContext) => {
 		const text = userPromptText(event);
-		return runLifecycle("UserPromptSubmit", ctx, JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: text, input: text, cwd: ctx.cwd }), "info");
+		return runLifecycle("UserPromptSubmit", ctx, JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: text, input: text, cwd: ctx.cwd }));
 	});
 
 	pi.on("turn_end", (_event, ctx: ExtensionContext) =>
-		runLifecycle("Stop", ctx, JSON.stringify({ hook_event_name: "Stop", cwd: ctx.cwd }), "warning"),
+		runLifecycle("Stop", ctx, JSON.stringify({ hook_event_name: "Stop", cwd: ctx.cwd })),
 	);
 }
