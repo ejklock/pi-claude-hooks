@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -15,11 +15,21 @@ interface HookCommand {
 	type?: string;
 	command?: string;
 	timeout?: number;
+	pluginRoot?: string;
 }
 
 interface HookMatcher {
 	matcher?: string;
 	hooks?: HookCommand[];
+}
+
+interface PluginHookSource {
+	hooksFile: string;
+	pluginRoot: string;
+}
+
+interface InstalledPluginRecord {
+	installPath?: string;
 }
 
 interface CommandResult {
@@ -42,13 +52,17 @@ function isDisabled(): boolean {
 	return process.env.PI_CLAUDE_HOOKS_DISABLED === "1";
 }
 
-function readHooksFile(path: string): Record<string, HookMatcher[]> | null {
+function readJsonFile<T>(path: string): T | null {
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8")) as { hooks?: Record<string, HookMatcher[]> };
-		return parsed.hooks ?? null;
+		return JSON.parse(readFileSync(path, "utf8")) as T;
 	} catch {
 		return null;
 	}
+}
+
+function readHooksFile(path: string): Record<string, HookMatcher[]> | null {
+	const parsed = readJsonFile<{ hooks?: Record<string, HookMatcher[]> }>(path);
+	return parsed?.hooks ?? null;
 }
 
 // Project settings extend (not replace) global settings, mirroring Claude Code's
@@ -77,10 +91,60 @@ function matcherApplies(matcher: string | undefined, toolNames: string[]): boole
 	return toolNames.some((name) => pattern.test(name));
 }
 
-// pi-claude-hooks owns the memory session lifecycle; @vahor/pi-hooks was retired.
-export function commandsFor(event: ClaudeEvent, cwd: string, toolNames: string[], sources?: string[]): HookCommand[] {
+function defaultSettingsSources(cwd: string): string[] {
+	return [join(homedir(), ".claude", "settings.json"), join(cwd, ".claude", "settings.json")];
+}
+
+// enabledPlugins maps "name@marketplace" -> boolean; later sources (project settings)
+// override earlier ones (global settings), mirroring Claude Code's own merge order.
+export function enabledPluginKeys(sources: string[]): Set<string> {
+	const merged: Record<string, boolean> = {};
+	for (const source of sources) {
+		const parsed = readJsonFile<{ enabledPlugins?: Record<string, boolean> }>(source);
+		if (parsed?.enabledPlugins) Object.assign(merged, parsed.enabledPlugins);
+	}
+	const enabled = new Set<string>();
+	for (const [key, value] of Object.entries(merged)) {
+		if (value === true) enabled.add(key);
+	}
+	return enabled;
+}
+
+function pluginHookSources(sources: string[], pluginsRoot: string): PluginHookSource[] {
+	const manifest = readJsonFile<{ plugins?: Record<string, InstalledPluginRecord[]> }>(
+		join(pluginsRoot, "installed_plugins.json"),
+	);
+	if (!manifest?.plugins) return [];
+	const result: PluginHookSource[] = [];
+	for (const key of enabledPluginKeys(sources)) {
+		const record = (manifest.plugins[key] ?? []).find(
+			(candidate) => candidate.installPath && existsSync(join(candidate.installPath, "hooks", "hooks.json")),
+		);
+		if (!record?.installPath) continue;
+		result.push({ hooksFile: join(record.installPath, "hooks", "hooks.json"), pluginRoot: record.installPath });
+	}
+	return result;
+}
+
+// Every HookCommand a plugin declares is stamped with its install directory so
+// runHookCommand can resolve ${CLAUDE_PLUGIN_ROOT} in the command string at run time.
+function pluginMatchersFor(event: ClaudeEvent, sources: string[], pluginsRoot: string): HookMatcher[] {
+	const matchers: HookMatcher[] = [];
+	for (const { hooksFile, pluginRoot } of pluginHookSources(sources, pluginsRoot)) {
+		const hooks = readHooksFile(hooksFile);
+		for (const entry of hooks?.[event] ?? []) {
+			matchers.push({
+				matcher: entry.matcher,
+				hooks: (entry.hooks ?? []).map((hook) => ({ ...hook, pluginRoot })),
+			});
+		}
+	}
+	return matchers;
+}
+
+function collectMatchingCommands(matchers: HookMatcher[], toolNames: string[]): HookCommand[] {
 	const commands: HookCommand[] = [];
-	for (const entry of matchersFor(event, cwd, sources)) {
+	for (const entry of matchers) {
 		if (!matcherApplies(entry.matcher, toolNames)) continue;
 		for (const hook of entry.hooks ?? []) {
 			if (hook.type !== "command" || !hook.command) continue;
@@ -90,11 +154,35 @@ export function commandsFor(event: ClaudeEvent, cwd: string, toolNames: string[]
 	return commands;
 }
 
-function runHookCommand(command: string, stdin: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
+// pi-claude-hooks owns the memory session lifecycle; @vahor/pi-hooks was retired.
+// Settings hooks (~/.claude/settings.json) are collected first, then enabled-plugin
+// hooks (installed_plugins.json -> <installPath>/hooks/hooks.json) are appended.
+export function commandsFor(
+	event: ClaudeEvent,
+	cwd: string,
+	toolNames: string[],
+	sources?: string[],
+	pluginsRoot: string = join(homedir(), ".claude", "plugins"),
+): HookCommand[] {
+	const settingsCommands = collectMatchingCommands(matchersFor(event, cwd, sources), toolNames);
+	const pluginCommands = collectMatchingCommands(
+		pluginMatchersFor(event, sources ?? defaultSettingsSources(cwd), pluginsRoot),
+		toolNames,
+	);
+	return [...settingsCommands, ...pluginCommands];
+}
+
+function runHookCommand(
+	command: string,
+	stdin: string,
+	cwd: string,
+	timeoutMs: number,
+	pluginRoot?: string,
+): Promise<CommandResult> {
 	return new Promise((resolveResult) => {
 		const child = spawn("sh", ["-c", command], {
 			cwd,
-			env: { ...process.env, CLAUDE_PROJECT_DIR: cwd },
+			env: { ...process.env, CLAUDE_PROJECT_DIR: cwd, ...(pluginRoot ? { CLAUDE_PLUGIN_ROOT: pluginRoot } : {}) },
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		const out: Buffer[] = [];
@@ -119,22 +207,37 @@ function runHookCommand(command: string, stdin: string, cwd: string, timeoutMs: 
 	});
 }
 
+interface AdvancedJsonHookOutput {
+	decision?: string;
+	permissionDecision?: string;
+	reason?: string;
+	permissionDecisionReason?: string;
+	hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+}
+
+function resolveDecision(parsed: AdvancedJsonHookOutput): string | undefined {
+	return parsed.hookSpecificOutput?.permissionDecision ?? parsed.permissionDecision ?? parsed.decision;
+}
+
+function resolveReason(parsed: AdvancedJsonHookOutput): string {
+	return (
+		parsed.hookSpecificOutput?.permissionDecisionReason ??
+		parsed.permissionDecisionReason ??
+		parsed.reason ??
+		"Blocked by a PreToolUse hook."
+	);
+}
+
 // Claude's PreToolUse advanced JSON: either {hookSpecificOutput:{permissionDecision:"deny",…}}
 // or the legacy {decision:"block", reason}. Parse the last non-empty stdout line as JSON.
 function jsonBlockReason(stdout: string): string | null {
 	const line = stdout.trim().split("\n").pop()?.trim();
 	if (!line || !line.startsWith("{")) return null;
 	try {
-		const parsed = JSON.parse(line) as {
-			decision?: string;
-			permissionDecision?: string;
-			reason?: string;
-			permissionDecisionReason?: string;
-			hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
-		};
-		const decision = parsed.hookSpecificOutput?.permissionDecision ?? parsed.permissionDecision ?? parsed.decision;
+		const parsed = JSON.parse(line) as AdvancedJsonHookOutput;
+		const decision = resolveDecision(parsed);
 		if (decision === "deny" || decision === "block") {
-			return parsed.hookSpecificOutput?.permissionDecisionReason ?? parsed.permissionDecisionReason ?? parsed.reason ?? "Blocked by a PreToolUse hook.";
+			return resolveReason(parsed);
 		}
 	} catch {
 		return null;
@@ -171,6 +274,30 @@ function preToolUsePayload(toolName: string, toolInput: Record<string, unknown>,
 	});
 }
 
+interface HookEvaluation {
+	block?: BlockDecision;
+	note?: string;
+}
+
+// Exit code 2, or Claude's advanced-JSON deny/block decision, blocks the tool
+// call; any other non-empty stdout becomes a note surfaced via notify.
+async function evaluatePreToolUseHook(hook: HookCommand, stdin: string, cwd: string): Promise<HookEvaluation> {
+	const result = await runHookCommand(
+		hook.command!,
+		stdin,
+		cwd,
+		hook.timeout ? hook.timeout * 1000 : TOOL_CALL_TIMEOUT_MS,
+		hook.pluginRoot,
+	);
+	const jsonReason = jsonBlockReason(result.stdout);
+	if (result.code === 2 || jsonReason) {
+		const reason = (jsonReason || result.stderr || result.stdout).trim() || "Blocked by a PreToolUse hook.";
+		return { block: { block: true, reason } };
+	}
+	const note = result.stdout.trim();
+	return note ? { note } : {};
+}
+
 async function handleToolCall(event: PiToolCallEvent, ctx: ExtensionContext): Promise<BlockDecision | undefined> {
 	if (isDisabled()) return undefined;
 	const piTool = typeof event.toolName === "string" ? event.toolName : "";
@@ -184,12 +311,9 @@ async function handleToolCall(event: PiToolCallEvent, ctx: ExtensionContext): Pr
 
 	const notes: string[] = [];
 	for (const hook of commands) {
-		const result = await runHookCommand(hook.command!, stdin, ctx.cwd, hook.timeout ? hook.timeout * 1000 : TOOL_CALL_TIMEOUT_MS);
-		const jsonReason = jsonBlockReason(result.stdout);
-		if (result.code === 2 || jsonReason) {
-			return { block: true, reason: (jsonReason || result.stderr || result.stdout).trim() || "Blocked by a PreToolUse hook." };
-		}
-		if (result.stdout.trim()) notes.push(result.stdout.trim());
+		const { block, note } = await evaluatePreToolUseHook(hook, stdin, ctx.cwd);
+		if (block) return block;
+		if (note) notes.push(note);
 	}
 	if (notes.length > 0) notify(ctx, notes.join("\n"), "warning");
 	return undefined;
@@ -197,17 +321,35 @@ async function handleToolCall(event: PiToolCallEvent, ctx: ExtensionContext): Pr
 
 // Routine hook stdout is intentionally NOT surfaced — only failures and PreToolUse
 // guard output notify, so recurring status chatter never floods the UI.
-async function runLifecycle(event: ClaudeEvent, ctx: ExtensionContext, stdin: string, sources?: string[]): Promise<void> {
+async function runLifecycle(
+	event: ClaudeEvent,
+	ctx: ExtensionContext,
+	stdin: string,
+	sources?: string[],
+	pluginsRoot?: string,
+): Promise<void> {
 	if (isDisabled()) return;
-	for (const hook of commandsFor(event, ctx.cwd, [], sources)) {
-		await runHookCommand(hook.command!, stdin, ctx.cwd, hook.timeout ? hook.timeout * 1000 : LIFECYCLE_TIMEOUT_MS);
+	for (const hook of commandsFor(event, ctx.cwd, [], sources, pluginsRoot)) {
+		await runHookCommand(
+			hook.command!,
+			stdin,
+			ctx.cwd,
+			hook.timeout ? hook.timeout * 1000 : LIFECYCLE_TIMEOUT_MS,
+			hook.pluginRoot,
+		);
 	}
 }
 
 // SessionStart hooks (git fetch, daemon warmup) can take tens of seconds; running
 // them detached keeps pi startup instant while their output still surfaces via notify.
-export function runLifecycleDetached(event: ClaudeEvent, ctx: ExtensionContext, stdin: string, sources?: string[]): void {
-	runLifecycle(event, ctx, stdin, sources).catch((error) => {
+export function runLifecycleDetached(
+	event: ClaudeEvent,
+	ctx: ExtensionContext,
+	stdin: string,
+	sources?: string[],
+	pluginsRoot?: string,
+): void {
+	runLifecycle(event, ctx, stdin, sources, pluginsRoot).catch((error) => {
 		// The ctx may be stale by the time a slow background hook fails (session
 		// already replaced or exited); touching it then throws, so guard the notify.
 		try {
