@@ -28,6 +28,21 @@ The `memory-session-(start|end).sh` scripts are skipped by default — Pi alread
 `@vahor/pi-hooks` memory wiring (`install_pi_memory_hooks`), so running them here would double-fire the
 handoff digest and the session_end observation.
 
+## Plugin hooks
+
+Hooks are not only read from `settings.json` — hooks declared by **enabled Claude Code plugins** are
+bridged too, giving full hook parity (e.g. a plugin like `living-docs-enforcer` reaches Pi the same way
+a `settings.json` hook does). Resolution works the same way Claude Code resolves it:
+
+1. `enabledPlugins` (`"name@marketplace" -> boolean`) is read from the same settings sources
+   (global then project, later overriding earlier) — only keys whose final value is `true` count.
+2. Each enabled key is looked up in `~/.claude/plugins/installed_plugins.json` for an install record
+   whose `<installPath>/hooks/hooks.json` exists.
+3. That plugin's hooks for the current event are appended **after** the `settings.json` hooks.
+
+A plugin hook command may reference `${CLAUDE_PLUGIN_ROOT}` — it is resolved at run time to that
+plugin's `installPath`, exactly as Claude Code sets it, so plugin hook commands work unchanged.
+
 ## Config
 
 - `PI_CLAUDE_HOOKS_DISABLED=1` — disable the extension entirely.
