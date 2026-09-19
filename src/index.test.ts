@@ -1,11 +1,11 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { commandsFor, runLifecycleDetached } from "./index.ts";
+import { commandsFor, runCompletedSubagentPostToolUse, runLifecycleDetached, runPostToolUse } from "./index.ts";
 
 function fakeCtx(cwd: string): ExtensionContext {
 	return { cwd, hasUI: false, ui: { notify() {} } } as unknown as ExtensionContext;
@@ -171,6 +171,77 @@ describe("commandsFor — plugin hook parity", () => {
 		const missingResult = commandsFor("PreToolUse", tmpDir, [], [settingsPath], missingRoot);
 		assert.strictEqual(missingResult.length, 1);
 		assert.strictEqual(missingResult[0]!.command, settingsCmd);
+	});
+});
+
+describe("commandsFor — PostToolUse parity", () => {
+	let tmpDir: string;
+
+	before(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "pi-claude-hooks-post-tool-use-"));
+	});
+
+	after(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it("returns a matching PostToolUse hook", () => {
+		const cmd = "/home/user/.claude/hooks/post-tool-use.sh";
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Agent|Bash", hooks: [{ type: "command", command: cmd }] }],
+		});
+
+		const result = commandsFor("PostToolUse", tmpDir, ["Agent"], [settingsPath]);
+
+		assert.strictEqual(result.length, 1);
+		assert.strictEqual(result[0]!.command, cmd);
+	});
+
+	it("passes a completed Bash result with Claude-shaped stdin", async () => {
+		const marker = join(tmpDir, "bash-post-tool-use.json");
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `cat > ${marker}` }] }],
+		});
+
+		await runPostToolUse(
+			{ toolName: "bash", toolCallId: "tool-17", input: { command: "printf done" }, content: [{ type: "text", text: "done" }], details: { code: 0 }, isError: false },
+			fakeCtx(tmpDir),
+			[settingsPath],
+		);
+
+		assert.deepStrictEqual(JSON.parse(readFileSync(marker, "utf8")), {
+			session_id: "",
+			transcript_path: "",
+			cwd: tmpDir,
+			hook_event_name: "PostToolUse",
+			tool_use_id: "tool-17",
+			tool_name: "Bash",
+			tool_input: { command: "printf done" },
+			tool_response: { content: [{ type: "text", text: "done" }], details: { code: 0 }, isError: false },
+		});
+	});
+
+	it("defers Agent PostToolUse until the background subagent completes", async () => {
+		const marker = join(tmpDir, "agent-post-tool-use.json");
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Agent", hooks: [{ type: "command", command: `cat > ${marker}` }] }],
+		});
+		const ctx = fakeCtx(tmpDir);
+
+		await runPostToolUse({ toolName: "Agent", input: { subagent_type: "coder" }, content: [] }, ctx, [settingsPath]);
+		assert.strictEqual(existsSync(marker), false);
+
+		await runCompletedSubagentPostToolUse({ id: "agent-42", type: "coder", result: { status: "done" } }, ctx, [settingsPath]);
+		assert.deepStrictEqual(JSON.parse(readFileSync(marker, "utf8")), {
+			session_id: "",
+			transcript_path: "",
+			cwd: tmpDir,
+			hook_event_name: "PostToolUse",
+			tool_use_id: "agent-42",
+			tool_name: "Agent",
+			tool_input: { subagent_type: "coder" },
+			tool_response: { status: "done" },
+		});
 	});
 });
 

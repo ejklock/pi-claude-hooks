@@ -17,12 +17,17 @@ It reads hook definitions from the **same source Claude Code uses** — `~/.clau
 | Claude hook event | Pi event | Blocks? | Synthesized stdin |
 |---|---|---|---|
 | `PreToolUse` | `tool_call` | **yes** — exit 2 / `permissionDecision:"deny"` / `decision:"block"` | `{tool_name, tool_input:{command}}` |
+| `PostToolUse` | `tool_result`; `subagents:completed` for background `Agent` | no | `{tool_name, tool_input, tool_response, cwd}` |
 | `SessionStart` | `session_start` | no (notifies) | `{hook_event_name, source, cwd}` |
 | `UserPromptSubmit` | `input` | no (notifies) | `{prompt, input, cwd}` |
 | `Stop` | `turn_end` | no (notifies) | `{hook_event_name, cwd}` |
 
 Hook commands run via `sh -c <command>` with `cwd` and `CLAUDE_PROJECT_DIR` set to the project dir,
 exactly as Claude Code runs them. Non-blocking hook stdout is surfaced via `ctx.ui.notify`.
+
+Background `Agent` calls are observed only when `@tintinweb/pi-subagents` emits
+`subagents:completed`. The initial `Agent` tool result is a dispatch receipt, not a completed result,
+so it never fires `PostToolUse` early or twice.
 
 The `memory-session-(start|end).sh` scripts are skipped by default — Pi already runs them through the
 `@vahor/pi-hooks` memory wiring (`install_pi_memory_hooks`), so running them here would double-fire the

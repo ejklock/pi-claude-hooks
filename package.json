@@ -1,7 +1,7 @@
 {
   "name": "pi-claude-hooks",
   "version": "0.2.0",
-  "description": "Runs Claude Code-style settings.json hooks under the pi coding agent. Bridges Pi lifecycle events to the Claude hook contract (PreToolUse/SessionStart/UserPromptSubmit/Stop), synthesizing the Claude-shaped stdin JSON and honoring exit-code-2 / permissionDecision:deny / decision:block to BLOCK a tool call. Gives Pi behavior parity with Claude Code for any project that registers hooks in ~/.claude/settings.json (e.g. Planet Argon's guard scripts).",
+  "description": "Runs Claude Code-style settings.json hooks under the pi coding agent. Bridges Pi lifecycle events to the Claude hook contract (PreToolUse/PostToolUse/SessionStart/SessionEnd/UserPromptSubmit/Stop), synthesizing Claude-shaped stdin and honoring blocking PreToolUse decisions. Gives Pi behavior parity with Claude Code for settings and plugin hooks.",
   "license": "MIT",
   "type": "module",
   "private": true,
