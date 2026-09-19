@@ -9,7 +9,7 @@ const INSTALL_SYMBOL = Symbol.for("ai-configs.pi-claude-hooks.installed");
 const TOOL_CALL_TIMEOUT_MS = 5000;
 const LIFECYCLE_TIMEOUT_MS = 10000;
 
-export type ClaudeEvent = "PreToolUse" | "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "Stop";
+export type ClaudeEvent = "PreToolUse" | "PostToolUse" | "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "Stop";
 
 interface HookCommand {
 	type?: string;
@@ -41,6 +41,19 @@ interface CommandResult {
 interface PiToolCallEvent {
 	toolName?: string;
 	input?: Record<string, unknown>;
+}
+
+interface PiToolResultEvent extends PiToolCallEvent {
+	toolCallId?: string;
+	content?: unknown;
+	details?: unknown;
+	isError?: boolean;
+}
+
+interface SubagentCompletedEvent {
+	id?: string;
+	type?: string;
+	result?: unknown;
 }
 
 interface BlockDecision {
@@ -274,6 +287,25 @@ function preToolUsePayload(toolName: string, toolInput: Record<string, unknown>,
 	});
 }
 
+export function postToolUsePayload(
+	toolName: string,
+	toolInput: Record<string, unknown>,
+	toolResponse: unknown,
+	cwd: string,
+	toolUseId?: string,
+): string {
+	return JSON.stringify({
+		session_id: "",
+		transcript_path: "",
+		cwd,
+		hook_event_name: "PostToolUse",
+		...(toolUseId === undefined ? {} : { tool_use_id: toolUseId }),
+		tool_name: toolName,
+		tool_input: toolInput,
+		tool_response: toolResponse,
+	});
+}
+
 interface HookEvaluation {
 	block?: BlockDecision;
 	note?: string;
@@ -327,9 +359,10 @@ async function runLifecycle(
 	stdin: string,
 	sources?: string[],
 	pluginsRoot?: string,
+	toolNames: string[] = [],
 ): Promise<void> {
 	if (isDisabled()) return;
-	for (const hook of commandsFor(event, ctx.cwd, [], sources, pluginsRoot)) {
+	for (const hook of commandsFor(event, ctx.cwd, toolNames, sources, pluginsRoot)) {
 		await runHookCommand(
 			hook.command!,
 			stdin,
@@ -366,14 +399,54 @@ function userPromptText(event: unknown): string {
 	return "";
 }
 
+export function runPostToolUse(
+	event: PiToolResultEvent,
+	ctx: ExtensionContext,
+	sources?: string[],
+	pluginsRoot?: string,
+): Promise<void> {
+	const piTool = typeof event.toolName === "string" ? event.toolName : "";
+	if (!piTool || piTool.toLowerCase() === "agent") return Promise.resolve();
+	const claudeTool = claudeToolName(piTool);
+	const response = { content: event.content, details: event.details, isError: event.isError ?? false };
+	const stdin = postToolUsePayload(claudeTool, event.input ?? {}, response, ctx.cwd, event.toolCallId);
+	return runLifecycle("PostToolUse", ctx, stdin, sources, pluginsRoot, [claudeTool, piTool]);
+}
+
+export function runCompletedSubagentPostToolUse(
+	event: SubagentCompletedEvent,
+	ctx: ExtensionContext,
+	sources?: string[],
+	pluginsRoot?: string,
+): Promise<void> {
+	if (typeof event.type !== "string" || event.type.length === 0) return Promise.resolve();
+	const stdin = postToolUsePayload("Agent", { subagent_type: event.type }, event.result, ctx.cwd, event.id);
+	return runLifecycle("PostToolUse", ctx, stdin, sources, pluginsRoot, ["Agent"]);
+}
+
 export default function piClaudeHooks(pi: ExtensionAPI): void {
 	const guard = pi as unknown as Record<PropertyKey, unknown>;
 	if (guard[INSTALL_SYMBOL]) return;
 	guard[INSTALL_SYMBOL] = true;
+	let activeContext: ExtensionContext | undefined;
 
-	pi.on("tool_call", (event, ctx: ExtensionContext) => handleToolCall(event as PiToolCallEvent, ctx));
+	pi.on("tool_call", (event, ctx: ExtensionContext) => {
+		activeContext = ctx;
+		return handleToolCall(event as PiToolCallEvent, ctx);
+	});
+
+	pi.on("tool_result", (event, ctx: ExtensionContext) => {
+		activeContext = ctx;
+		return runPostToolUse(event as PiToolResultEvent, ctx);
+	});
+
+	pi.events.on("subagents:completed", (event: unknown) => {
+		if (activeContext === undefined) return;
+		return runCompletedSubagentPostToolUse(event as SubagentCompletedEvent, activeContext);
+	});
 
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+		activeContext = ctx;
 		runLifecycleDetached("SessionStart", ctx, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", cwd: ctx.cwd }));
 	});
 
