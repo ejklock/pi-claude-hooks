@@ -216,6 +216,9 @@ function runHookCommand(
 		child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
 		child.on("error", (error) => finish(-1, String(error)));
 		child.on("close", (code) => finish(typeof code === "number" ? code : -1));
+		// A hook that exits before draining a payload larger than the pipe buffer
+		// raises EPIPE here; unhandled, it would take the whole agent down.
+		child.stdin?.on("error", () => {});
 		child.stdin?.end(stdin);
 	});
 }
@@ -399,6 +402,16 @@ function userPromptText(event: unknown): string {
 	return "";
 }
 
+function isImageBlock(block: unknown): block is { type: "image"; mimeType?: unknown } {
+	return typeof block === "object" && block !== null && (block as { type?: unknown }).type === "image";
+}
+
+// Image blocks carry megabytes of base64 no hook consumes; the shape stays, the data goes.
+function withoutImageData(content: unknown): unknown {
+	if (!Array.isArray(content)) return content;
+	return content.map((block) => (isImageBlock(block) ? { type: "image", mimeType: block.mimeType, omitted: true } : block));
+}
+
 export function runPostToolUse(
 	event: PiToolResultEvent,
 	ctx: ExtensionContext,
@@ -408,7 +421,7 @@ export function runPostToolUse(
 	const piTool = typeof event.toolName === "string" ? event.toolName : "";
 	if (!piTool || piTool.toLowerCase() === "agent") return Promise.resolve();
 	const claudeTool = claudeToolName(piTool);
-	const response = { content: event.content, details: event.details, isError: event.isError ?? false };
+	const response = { content: withoutImageData(event.content), details: event.details, isError: event.isError ?? false };
 	const stdin = postToolUsePayload(claudeTool, event.input ?? {}, response, ctx.cwd, event.toolCallId);
 	return runLifecycle("PostToolUse", ctx, stdin, sources, pluginsRoot, [claudeTool, piTool]);
 }
