@@ -30,7 +30,8 @@ Background `Agent` calls are observed only when `@tintinweb/pi-subagents` emits
 so it never fires `PostToolUse` early or twice.
 
 Image blocks in a `PostToolUse` `tool_response` reach hooks as `{ type: "image", mimeType, omitted: true }`:
-the base64 data is dropped, since it can run to megabytes and no hook consumes it.
+the base64 data is dropped, since it can run to megabytes and no hook consumes it. The `mimeType` key is
+absent (omitted) when the tool gave none.
 
 The `memory-session-(start|end).sh` scripts are skipped by default — Pi already runs them through the
 `@vahor/pi-hooks` memory wiring (`install_pi_memory_hooks`), so running them here would double-fire the

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { commandsFor, runCompletedSubagentPostToolUse, runLifecycleDetached, runPostToolUse } from "./index.ts";
+import piClaudeHooks, { commandsFor, runCompletedSubagentPostToolUse, runLifecycleDetached, runPostToolUse } from "./index.ts";
 
 function fakeCtx(cwd: string): ExtensionContext {
 	return { cwd, hasUI: false, ui: { notify() {} } } as unknown as ExtensionContext;
@@ -396,6 +396,54 @@ describe("runLifecycleDetached — session_start does not block", () => {
 			assert.strictEqual(existsSync(marker), false, "hook ran despite kill switch");
 		} finally {
 			delete process.env.PI_CLAUDE_HOOKS_DISABLED;
+		}
+	});
+});
+
+describe("default export — PreToolUse hook that never reads a large stdin", () => {
+	let sandbox: string;
+
+	before(() => {
+		sandbox = mkdtempSync(join(tmpdir(), "pi-claude-hooks-epipe-"));
+	});
+
+	after(() => {
+		rmSync(sandbox, { recursive: true, force: true });
+	});
+
+	it("honors the exit code and stderr reason of a hook that exits 2 without reading a 4 MB payload", async () => {
+		const home = join(sandbox, "home");
+		const project = join(sandbox, "project");
+		mkdirSync(home, { recursive: true });
+		mkdirSync(join(project, ".claude"), { recursive: true });
+		writeSettings(join(project, ".claude"), {
+			PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo denied-by-hook >&2; exit 2" }] }],
+		});
+
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+		const fakePi = {
+			on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => handlers.set(name, handler),
+			events: { on() {} },
+		};
+		piClaudeHooks(fakePi as unknown as Parameters<typeof piClaudeHooks>[0]);
+
+		const previousHome = process.env.HOME;
+		const uncaught: unknown[] = [];
+		const capture = (error: unknown) => uncaught.push(error);
+		process.prependListener("uncaughtException", capture);
+		process.env.HOME = home;
+		try {
+			const result = await handlers.get("tool_call")!(
+				{ toolName: "bash", toolCallId: "tool-exit-code", input: { command: "x".repeat(4 * 1024 * 1024) } },
+				fakeCtx(project),
+			);
+			await sleep(100);
+			assert.deepStrictEqual(result, { block: true, reason: "denied-by-hook" });
+			assert.deepStrictEqual(uncaught, []);
+		} finally {
+			process.off("uncaughtException", capture);
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
 		}
 	});
 });
