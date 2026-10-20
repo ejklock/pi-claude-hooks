@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { commandsFor, runCompletedSubagentPostToolUse, runLifecycleDetached, runPostToolUse } from "./index.ts";
+import piClaudeHooks, { commandsFor, runCompletedSubagentPostToolUse, runLifecycleDetached, runPostToolUse } from "./index.ts";
 
 function fakeCtx(cwd: string): ExtensionContext {
 	return { cwd, hasUI: false, ui: { notify() {} } } as unknown as ExtensionContext;
@@ -221,6 +221,56 @@ describe("commandsFor — PostToolUse parity", () => {
 		});
 	});
 
+	it("survives a hook that exits without reading a payload larger than the pipe buffer", async () => {
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "exit 0" }] }],
+		});
+		const uncaught: unknown[] = [];
+		const capture = (error: unknown) => uncaught.push(error);
+		process.prependListener("uncaughtException", capture);
+		try {
+			await runPostToolUse(
+				{ toolName: "bash", toolCallId: "tool-18", input: { command: "true" }, content: [{ type: "text", text: "x".repeat(4 * 1024 * 1024) }], isError: false },
+				fakeCtx(tmpDir),
+				[settingsPath],
+			);
+			await sleep(100);
+		} finally {
+			process.off("uncaughtException", capture);
+		}
+		assert.deepStrictEqual(uncaught, []);
+	});
+
+	it("passes an image result to the hook without its base64 data", async () => {
+		const marker = join(tmpDir, "read-image-post-tool-use.json");
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Read", hooks: [{ type: "command", command: `cat > ${marker}` }] }],
+		});
+
+		await runPostToolUse(
+			{
+				toolName: "read",
+				toolCallId: "tool-19",
+				input: { path: "/tmp/shot.png" },
+				content: [
+					{ type: "text", text: "Read image file [image/png]" },
+					{ type: "image", mimeType: "image/png", data: "A".repeat(3 * 1024 * 1024) },
+				],
+				isError: false,
+			},
+			fakeCtx(tmpDir),
+			[settingsPath],
+		);
+
+		assert.deepStrictEqual(JSON.parse(readFileSync(marker, "utf8")).tool_response, {
+			content: [
+				{ type: "text", text: "Read image file [image/png]" },
+				{ type: "image", mimeType: "image/png", omitted: true },
+			],
+			isError: false,
+		});
+	});
+
 	it("defers Agent PostToolUse until the background subagent completes", async () => {
 		const marker = join(tmpDir, "agent-post-tool-use.json");
 		const settingsPath = writeSettings(tmpDir, {
@@ -242,6 +292,68 @@ describe("commandsFor — PostToolUse parity", () => {
 			tool_input: { subagent_type: "coder" },
 			tool_response: { status: "done" },
 		});
+	});
+
+	async function resultSeenByHook(content: unknown): Promise<{ tool_response: Record<string, unknown> }> {
+		const marker = join(tmpDir, "captured-stdin.json");
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Read", hooks: [{ type: "command", command: `cat > ${marker}` }] }],
+		});
+		await runPostToolUse(
+			{ toolName: "read", toolCallId: "tool-capture", input: { path: "/tmp/x" }, content, isError: false } as Parameters<typeof runPostToolUse>[0],
+			fakeCtx(tmpDir),
+			[settingsPath],
+		);
+		return JSON.parse(readFileSync(marker, "utf8"));
+	}
+
+	async function uncaughtDuringHook(command: string, text: string): Promise<unknown[]> {
+		const settingsPath = writeSettings(tmpDir, {
+			PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+		});
+		const uncaught: unknown[] = [];
+		const capture = (error: unknown) => uncaught.push(error);
+		process.prependListener("uncaughtException", capture);
+		try {
+			await runPostToolUse(
+				{ toolName: "bash", toolCallId: "tool-size", input: { command: "true" }, content: [{ type: "text", text }], isError: false },
+				fakeCtx(tmpDir),
+				[settingsPath],
+			);
+			await sleep(100);
+		} finally {
+			process.off("uncaughtException", capture);
+		}
+		return uncaught;
+	}
+
+	it("resolves for a payload that fits the pipe buffer when the hook exits without reading it", async () => {
+		assert.deepStrictEqual(await uncaughtDuringHook("exit 0", "x".repeat(1024)), []);
+	});
+
+	it("resolves for a large payload when the hook exits non-zero without reading it", async () => {
+		assert.deepStrictEqual(await uncaughtDuringHook("exit 2", "x".repeat(4 * 1024 * 1024)), []);
+	});
+
+	it("delivers a large payload byte-for-byte to a hook that reads all of stdin", async () => {
+		const text = "y".repeat(4 * 1024 * 1024);
+		const seen = await resultSeenByHook([{ type: "text", text }]);
+		assert.deepStrictEqual(seen.tool_response.content, [{ type: "text", text }]);
+	});
+
+	it("leaves a plain-string result untouched", async () => {
+		const seen = await resultSeenByHook("plain output");
+		assert.equal(seen.tool_response.content, "plain output");
+	});
+
+	it("sends no content key when the result has no content", async () => {
+		const seen = await resultSeenByHook(undefined);
+		assert.equal("content" in seen.tool_response, false);
+	});
+
+	it("marks an image block without mimeType as omitted and sends no mimeType key", async () => {
+		const seen = await resultSeenByHook([{ type: "image", data: "QUJD" }]);
+		assert.deepStrictEqual(seen.tool_response.content, [{ type: "image", omitted: true }]);
 	});
 });
 
@@ -284,6 +396,54 @@ describe("runLifecycleDetached — session_start does not block", () => {
 			assert.strictEqual(existsSync(marker), false, "hook ran despite kill switch");
 		} finally {
 			delete process.env.PI_CLAUDE_HOOKS_DISABLED;
+		}
+	});
+});
+
+describe("default export — PreToolUse hook that never reads a large stdin", () => {
+	let sandbox: string;
+
+	before(() => {
+		sandbox = mkdtempSync(join(tmpdir(), "pi-claude-hooks-epipe-"));
+	});
+
+	after(() => {
+		rmSync(sandbox, { recursive: true, force: true });
+	});
+
+	it("honors the exit code and stderr reason of a hook that exits 2 without reading a 4 MB payload", async () => {
+		const home = join(sandbox, "home");
+		const project = join(sandbox, "project");
+		mkdirSync(home, { recursive: true });
+		mkdirSync(join(project, ".claude"), { recursive: true });
+		writeSettings(join(project, ".claude"), {
+			PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo denied-by-hook >&2; exit 2" }] }],
+		});
+
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+		const fakePi = {
+			on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => handlers.set(name, handler),
+			events: { on() {} },
+		};
+		piClaudeHooks(fakePi as unknown as Parameters<typeof piClaudeHooks>[0]);
+
+		const previousHome = process.env.HOME;
+		const uncaught: unknown[] = [];
+		const capture = (error: unknown) => uncaught.push(error);
+		process.prependListener("uncaughtException", capture);
+		process.env.HOME = home;
+		try {
+			const result = await handlers.get("tool_call")!(
+				{ toolName: "bash", toolCallId: "tool-exit-code", input: { command: "x".repeat(4 * 1024 * 1024) } },
+				fakeCtx(project),
+			);
+			await sleep(100);
+			assert.deepStrictEqual(result, { block: true, reason: "denied-by-hook" });
+			assert.deepStrictEqual(uncaught, []);
+		} finally {
+			process.off("uncaughtException", capture);
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
 		}
 	});
 });
